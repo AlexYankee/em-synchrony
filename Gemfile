@@ -13,7 +13,7 @@ group :development do
   gem 'bson_ext'
   gem 'mysql2'
   gem 'em-redis', '~> 0.3.0'
-  gem 'em-hiredis'
+  gem 'em-hiredis', '>= 0.2.0'
   gem 'mongo'
   gem 'amqp'
 end
