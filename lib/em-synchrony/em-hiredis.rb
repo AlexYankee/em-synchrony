@@ -9,11 +9,10 @@ module EventMachine
 
     def self.connect(uri = nil)
       client = setup(uri)
-      EM::Synchrony.sync client.connect
-      client
+      client.connect
     end
 
-    class Client
+    class BaseClient
       def self.connect(host = 'localhost', port = 6379)
         conn = new(host, port)
         EM::Synchrony.sync conn.connect
@@ -25,17 +24,30 @@ module EventMachine
 
         @connection.on(:closed) do
           if @connected
-            @defs.each { |d| d.fail("Redis disconnected") }
+            @defs.each { |d| d.fail(Error.new("Redis disconnected")) }
             @defs = []
             @deferred_status = nil
             @connected = false
             unless @closing_connection
-              @reconnecting = true
-              reconnect
+              # Next tick avoids reconnecting after for example EM.stop
+              EM.next_tick { reconnect }
             end
+            emit(:disconnected)
+            EM::Hiredis.logger.info("#{@connection} Disconnected")
           else
             unless @closing_connection
-              EM.add_timer(1) { reconnect }
+              @reconnect_failed_count += 1
+              @reconnect_timer = EM.add_timer(EM::Hiredis.reconnect_timeout) {
+                @reconnect_timer = nil
+                reconnect
+              }
+              emit(:reconnect_failed, @reconnect_failed_count)
+              EM::Hiredis.logger.info("#{@connection} Reconnect failed")
+
+              if @reconnect_failed_count >= 4
+                emit(:failed)
+                self.fail(Error.new("Could not connect after 4 attempts"))
+              end
             end
           end
         end
@@ -43,12 +55,20 @@ module EventMachine
         @connection.on(:connected) do
           Fiber.new do
             @connected = true
+            @reconnect_failed_count = 0
+            @failed = false
 
+            select(@db) unless @db == 0
             auth(@password) if @password
-            select(@db) if @db
 
-            @subs.each { |s| method_missing(:subscribe, s) }
-            @psubs.each { |s| method_missing(:psubscribe, s) }
+            @command_queue.each do |df, command, args|
+              @connection.send_command(command, args)
+              @defs.push(df)
+            end
+            @command_queue = []
+
+            emit(:connected)
+            EM::Hiredis.logger.info("#{@connection} Connected")
             succeed
 
             if @reconnecting
@@ -62,29 +82,11 @@ module EventMachine
           if RuntimeError === reply
             raise "Replies out of sync: #{reply.inspect}" if @defs.empty?
             deferred = @defs.shift
-            deferred.fail(reply) if deferred
+            error = RedisError.new(reply.message)
+            error.redis_error = reply
+            deferred.fail(error) if deferred
           else
-            if reply && PUBSUB_MESSAGES.include?(reply[0]) # reply can be nil
-              kind, subscription, d1, d2 = *reply
-
-              case kind.to_sym
-              when :message
-                emit(:message, subscription, d1)
-              when :pmessage
-                emit(:pmessage, subscription, d1, d2)
-              end
-            else
-              if @defs.empty?
-                if @monitoring
-                  emit(:monitor, reply)
-                else
-                  raise "Replies out of sync: #{reply.inspect}"
-                end
-              else
-                deferred = @defs.shift
-                deferred.succeed(reply) if deferred
-              end
-            end
+            handle_reply(reply)
           end
         end
 
