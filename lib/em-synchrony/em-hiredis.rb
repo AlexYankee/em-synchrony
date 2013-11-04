@@ -9,7 +9,8 @@ module EventMachine
 
     def self.connect(uri = nil)
       client = setup(uri)
-      client.connect
+      EM::Synchrony.sync client.connect
+      client
     end
 
     class BaseClient
